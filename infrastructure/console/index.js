@@ -1,27 +1,32 @@
 import express from "express";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const app = express();
 
-const PORT = 8080;
-
+const PORT = Number(process.env.PORT || 8080);
 const MANAGER_URL =
-  process.env.MANAGER_URL ||
-  "http://staark-demo-manager:8080";
+  process.env.MANAGER_URL || "http://staark-demo-manager:8080";
+const HUB_SECRET = process.env.HUB_SECRET || "";
+const CONSOLE_USER = process.env.CONSOLE_USER || "";
+const CONSOLE_PASSWORD = process.env.CONSOLE_PASSWORD || "";
+const DEMO_HOST = process.env.DEMO_HOST || "demo.staark-app.cloud";
+const CSRF_TOKEN = randomBytes(32).toString("hex");
+const PUBLIC_DIR = fileURLToPath(new URL("./public", import.meta.url));
 
-const HUB_SECRET =
-  process.env.HUB_SECRET;
-
-const CONSOLE_USER =
-  process.env.CONSOLE_USER;
-
-const CONSOLE_PASSWORD =
-  process.env.CONSOLE_PASSWORD;
-
-app.use(
-  express.urlencoded({
-    extended: true,
-  })
-);
+app.disable("x-powered-by");
+app.use(express.urlencoded({ extended: false, limit: "16kb" }));
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; style-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+  );
+  next();
+});
 
 function escapeHtml(value = "") {
   return String(value)
@@ -32,1757 +37,316 @@ function escapeHtml(value = "") {
     .replaceAll("'", "&#039;");
 }
 
+function safeEqual(left, right) {
+  const a = Buffer.from(String(left));
+  const b = Buffer.from(String(right));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function auth(req, res, next) {
-  const header =
-    req.headers.authorization;
-
-  if (
-    !header ||
-    !header.startsWith("Basic ")
-  ) {
-    res.setHeader(
-      "WWW-Authenticate",
-      'Basic realm="Staark Demo Console"'
-    );
-
-    return res
-      .status(401)
-      .send("Authentication required");
+  if (!CONSOLE_USER || !CONSOLE_PASSWORD) {
+    return res.status(503).send("Console credentials are not configured");
   }
 
-  const decoded = Buffer
-    .from(
-      header.slice(6),
-      "base64"
-    )
-    .toString();
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Staark Demo Console"');
+    return res.status(401).send("Authentication required");
+  }
 
-  const separator =
-    decoded.indexOf(":");
+  let decoded = "";
+  try {
+    decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+  } catch {
+    decoded = "";
+  }
 
-  const username =
-    decoded.slice(
-      0,
-      separator
-    );
+  const separator = decoded.indexOf(":");
+  const username = separator >= 0 ? decoded.slice(0, separator) : "";
+  const password = separator >= 0 ? decoded.slice(separator + 1) : "";
 
-  const password =
-    decoded.slice(
-      separator + 1
-    );
-
-  if (
-    username !== CONSOLE_USER ||
-    password !== CONSOLE_PASSWORD
-  ) {
-    res.setHeader(
-      "WWW-Authenticate",
-      'Basic realm="Staark Demo Console"'
-    );
-
-    return res
-      .status(401)
-      .send("Unauthorized");
+  if (!safeEqual(username, CONSOLE_USER) || !safeEqual(password, CONSOLE_PASSWORD)) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Staark Demo Console"');
+    return res.status(401).send("Unauthorized");
   }
 
   next();
 }
 
-app.use(auth);
+function verifyCsrf(req, res, next) {
+  if (!safeEqual(req.body?.csrf || "", CSRF_TOKEN)) {
+    return res.status(403).send("Invalid request token");
+  }
+  next();
+}
 
-async function manager(
-  path,
-  options = {}
-) {
-  const response =
-    await fetch(
-      `${MANAGER_URL}${path}`,
-      {
-        ...options,
+async function manager(path, options = {}) {
+  const response = await fetch(`${MANAGER_URL}${path}`, {
+    ...options,
+    signal: options.signal || AbortSignal.timeout(8_000),
+    headers: {
+      Authorization: `Bearer ${HUB_SECRET}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
 
-        headers: {
-          Authorization:
-            `Bearer ${HUB_SECRET}`,
-
-          "Content-Type":
-            "application/json",
-
-          ...(
-            options.headers ||
-            {}
-          ),
-        },
-      }
-    );
-
-  const body =
-    await response.text();
-
+  const body = await response.text();
   if (!response.ok) {
-    throw new Error(
-      `Manager ${response.status}: ${body}`
-    );
+    throw new Error(`Manager ${response.status}: ${body}`);
   }
 
-  if (!body) {
-    return {};
-  }
+  if (!body) return {};
 
   try {
     return JSON.parse(body);
   } catch {
-    throw new Error(
-      `Invalid manager response: ${body}`
-    );
+    throw new Error(`Invalid manager response: ${body}`);
   }
 }
 
 function isRunning(demo) {
+  return demo.running === true || demo.state === "running";
+}
+
+function isAttention(demo) {
   return (
-    demo.state === "running" ||
-    String(
-      demo.status || ""
-    )
-      .toLowerCase()
-      .startsWith("up")
+    demo.health === "unhealthy" ||
+    ["dead", "restarting", "paused"].includes(String(demo.state || ""))
   );
 }
+
+function stateLabel(demo) {
+  if (demo.health === "unhealthy") return "Unhealthy";
+  if (demo.health === "starting") return "Starting";
+  if (isRunning(demo)) return "Running";
+  const value = String(demo.state || "stopped");
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function stateClass(demo) {
+  if (isAttention(demo) || demo.health === "starting") return "warning";
+  return isRunning(demo) ? "running" : "stopped";
+}
+
+function formatCreated(value) {
+  if (!value) return "—";
+  return String(value).replace(/\s+[+-]\d{4}.*$/, "").slice(0, 19);
+}
+
+function shellStart({ title, subtitle, eyebrow = "Infrastructure", now }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>${escapeHtml(title)} · Staark Demo Console</title>
+<link rel="stylesheet" href="/manage/assets/app.css">
+</head>
+<body>
+<div class="shell">
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/manage">
+      <span class="brand-mark">S</span>
+      <span class="brand-copy"><strong>STAARK</strong><span>Demo infrastructure</span></span>
+    </a>
+    <div class="topbar-meta">
+      <span class="connection"><span class="dot"></span>Manager connected</span>
+      <span class="clock">${escapeHtml(now)}</span>
+    </div>
+  </div>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="nav-label">WORKSPACE</div>
+    <nav class="nav">
+      <a class="nav-item active" href="/manage"><span class="nav-icon">▤</span>Environments</a>
+    </nav>
+    <div class="sidebar-foot">${escapeHtml(DEMO_HOST)}<br>console v1.1.0</div>
+  </aside>
+  <main class="content">
+    <section class="page-head">
+      <div>
+        <div class="eyebrow">${escapeHtml(eyebrow)}</div>
+        <h1>${escapeHtml(title)}</h1>
+        <div class="subtitle">${escapeHtml(subtitle)}</div>
+      </div>`;
+}
+
+function shellEnd() {
+  return `</main></div></div></body></html>`;
+}
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "staark-demo-console" });
+});
+
+app.use(auth);
+app.use(
+  "/manage/assets",
+  express.static(PUBLIC_DIR, {
+    fallthrough: false,
+    etag: true,
+    maxAge: "1h",
+  })
+);
 
 app.get("/", (req, res) => {
   res.redirect("/manage");
 });
 
-app.get(
-  "/manage",
-  async (req, res) => {
-    try {
-      const data =
-        await manager(
-          "/console"
-        );
-
-      const demos =
-        data.demos || [];
-
-      const running =
-        demos.filter(
-          isRunning
-        ).length;
-
-      const stopped =
-        demos.length -
-        running;
-
-      const rows =
-        demos
-          .map((demo) => {
-            const slug =
-              demo.slug ||
-              String(
-                demo.container || ""
-              )
-                .replace(
-                  /^staark-demo-/,
-                  ""
-                );
-
-            const online =
-              isRunning(demo);
-
-            const image =
-              demo.image || "—";
-
-            return `
-<tr
-  data-row
-  data-name="${escapeHtml(
-    slug.toLowerCase()
-  )}"
-  data-status="${
-    online
-      ? "running"
-      : "stopped"
-  }"
->
-  <td>
-    <div class="deployment-name">
-      ${escapeHtml(slug)}
-    </div>
-
-    <div class="deployment-path">
-      /${escapeHtml(slug)}
-    </div>
-  </td>
-
-  <td>
-    <span
-      class="status ${
-        online
-          ? "running"
-          : "stopped"
-      }"
-    >
-      <span></span>
-
-      ${
-        online
-          ? "RUNNING"
-          : "STOPPED"
-      }
-    </span>
-  </td>
-
-  <td>
-    <div
-      class="image-name"
-      title="${escapeHtml(
-        image
-      )}"
-    >
-      ${escapeHtml(image)}
-    </div>
-  </td>
-
-  <td>
-    <div class="created">
-      ${
-        demo.created
-          ? escapeHtml(
-              demo.created
-            )
-          : "—"
-      }
-    </div>
-  </td>
-
-  <td>
-    <div class="actions">
-
-      ${
-        online
-          ? `
-        <a
-          class="action"
-          href="https://demo.staark-app.cloud/${encodeURIComponent(
-            slug
-          )}"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          ↗ Open
-        </a>
-        `
-          : `
-        <span
-          class="action disabled"
-        >
-          ↗ Open
-        </span>
-        `
-      }
-
-      <a
-        class="action"
-        href="/manage/${encodeURIComponent(
-          slug
-        )}/logs"
-      >
-        ▤ Logs
-      </a>
-
-      ${
-        online
-          ? `
-        <form
-          method="POST"
-          action="/manage/${encodeURIComponent(
-            slug
-          )}/stop"
-        >
-          <button
-            class="action danger"
-            type="submit"
-          >
-            ■ Stop
-          </button>
-        </form>
-        `
-          : `
-        <form
-          method="POST"
-          action="/manage/${encodeURIComponent(
-            slug
-          )}/start"
-        >
-          <button
-            class="action success"
-            type="submit"
-          >
-            ▶ Start
-          </button>
-        </form>
-        `
-      }
-
-    </div>
-  </td>
-</tr>
-`;
-          })
-          .join("");
-
-      const now =
-        new Date()
-          .toLocaleString(
-            "sv-SE",
-            {
-              hour12: false,
-            }
-          );
-
-      res.send(`
-<!DOCTYPE html>
-
-<html lang="en">
-
-<head>
-
-<meta charset="utf-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1"
->
-
-<meta
-  name="robots"
-  content="noindex,nofollow"
->
-
-<title>
-  Staark Demo Console
-</title>
-
-<style>
-
-:root {
-  color-scheme: dark;
-
-  --bg: #0b0e12;
-  --sidebar: #0d1014;
-  --panel: #101419;
-  --panel-alt: #12171d;
-
-  --border: #252b33;
-  --border-soft: #1b2026;
-
-  --text: #e6e9ed;
-  --muted: #858d98;
-  --dim: #59616b;
-
-  --green: #35c878;
-  --red: #ef5e67;
-
-  --blue: #8aa2c8;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-html,
-body {
-  margin: 0;
-
-  min-height: 100%;
-
-  background:
-    var(--bg);
-
-  color:
-    var(--text);
-
-  font-family:
-    ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    Monaco,
-    Consolas,
-    "Liberation Mono",
-    monospace;
-
-  font-size: 13px;
-}
-
-body {
-  min-height: 100vh;
-}
-
-a {
-  color: inherit;
-
-  text-decoration: none;
-}
-
-button,
-input,
-select {
-  font: inherit;
-}
-
-.header {
-  height: 64px;
-
-  display: flex;
-  align-items: center;
-
-  border-bottom:
-    1px solid var(--border);
-
-  background:
-    #0c0f13;
-}
-
-.header-inner {
-  width: 100%;
-
-  padding:
-    0 28px;
-
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.brand {
-  display: flex;
-  align-items: baseline;
-  gap: 18px;
-}
-
-.brand strong {
-  font-family:
-    system-ui,
-    sans-serif;
-
-  font-size: 22px;
-  font-weight: 750;
-
-  letter-spacing:
-    .04em;
-}
-
-.brand span {
-  color:
-    var(--muted);
-
-  font-size: 12px;
-
-  letter-spacing:
-    .05em;
-}
-
-.header-meta {
-  display: flex;
-  align-items: center;
-
-  gap: 28px;
-
-  color:
-    var(--muted);
-
-  font-size: 11px;
-}
-
-.connection {
-  display: flex;
-  align-items: center;
-
-  gap: 9px;
-}
-
-.connection-dot {
-  width: 7px;
-  height: 7px;
-
-  border-radius:
-    50%;
-
-  background:
-    var(--green);
-}
-
-.layout {
-  min-height:
-    calc(
-      100vh - 64px
-    );
-
-  display: grid;
-
-  grid-template-columns:
-    210px 1fr;
-}
-
-.sidebar {
-  padding:
-    22px 12px;
-
-  display: flex;
-  flex-direction: column;
-
-  border-right:
-    1px solid var(--border);
-
-  background:
-    var(--sidebar);
-}
-
-.nav {
-  display: flex;
-  flex-direction: column;
-
-  gap: 5px;
-}
-
-.nav-item {
-  padding:
-    11px 13px;
-
-  display: flex;
-  align-items: center;
-
-  gap: 11px;
-
-  border-radius:
-    4px;
-
-  color:
-    var(--muted);
-}
-
-.nav-item.active {
-  background:
-    #171c22;
-
-  color:
-    var(--text);
-}
-
-.nav-icon {
-  width: 18px;
-
-  color:
-    #a7afb9;
-
-  text-align: center;
-}
-
-.sidebar-bottom {
-  margin-top: auto;
-
-  padding:
-    15px 10px 4px;
-
-  color:
-    var(--dim);
-
-  font-size: 10px;
-
-  line-height: 1.8;
-}
-
-.content {
-  min-width: 0;
-
-  padding:
-    40px;
-
-  overflow:
-    hidden;
-}
-
-.page-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-
-  gap: 30px;
-
-  margin-bottom:
-    30px;
-}
-
-.page-label {
-  margin-bottom:
-    9px;
-
-  color:
-    var(--dim);
-
-  font-size: 10px;
-
-  letter-spacing:
-    .08em;
-}
-
-h1 {
-  margin: 0;
-
-  font-family:
-    system-ui,
-    sans-serif;
-
-  font-size: 32px;
-  font-weight: 650;
-
-  letter-spacing:
-    -.03em;
-}
-
-.subtitle {
-  margin-top:
-    9px;
-
-  color:
-    var(--muted);
-
-  line-height:
-    1.6;
-}
-
-.head-actions {
-  display: flex;
-  align-items: center;
-
-  gap: 18px;
-}
-
-.refresh {
-  padding:
-    10px 14px;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  color:
-    #cad0d7;
-
-  background:
-    var(--panel);
-
-  cursor:
-    pointer;
-}
-
-.last-updated {
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-
-  line-height:
-    1.6;
-}
-
-.stats {
-  display: grid;
-
-  grid-template-columns:
-    repeat(
-      3,
-      minmax(
-        0,
-        1fr
-      )
-    );
-
-  gap:
-    14px;
-
-  margin-bottom:
-    28px;
-}
-
-.stat {
-  min-height:
-    92px;
-
-  padding:
-    18px 20px;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  background:
-    var(--panel);
-}
-
-.stat-label {
-  display: block;
-
-  margin-bottom:
-    12px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    11px;
-}
-
-.stat-value {
-  font-family:
-    system-ui,
-    sans-serif;
-
-  font-size:
-    27px;
-  font-weight:
-    650;
-}
-
-.stat-value.green {
-  color:
-    var(--green);
-}
-
-.toolbar {
-  display: grid;
-
-  grid-template-columns:
-    1fr 190px;
-
-  gap:
-    12px;
-
-  margin-bottom:
-    18px;
-}
-
-.search-wrap {
-  position:
-    relative;
-}
-
-.search-icon {
-  position:
-    absolute;
-
-  top:
-    50%;
-  left:
-    14px;
-
-  transform:
-    translateY(-50%);
-
-  color:
-    var(--muted);
-}
-
-.search {
-  width:
-    100%;
-  height:
-    42px;
-
-  padding:
-    0 14px 0 38px;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  outline:
-    none;
-
-  background:
-    var(--panel);
-
-  color:
-    var(--text);
-}
-
-.search:focus {
-  border-color:
-    #3c4652;
-}
-
-select {
-  height:
-    42px;
-
-  padding:
-    0 12px;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  outline:
-    none;
-
-  background:
-    var(--panel);
-
-  color:
-    var(--text);
-}
-
-.table-wrap {
-  overflow-x:
-    auto;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  background:
-    var(--panel);
-}
-
-table {
-  width:
-    100%;
-
-  min-width:
-    850px;
-
-  border-collapse:
-    collapse;
-}
-
-thead {
-  background:
-    var(--panel-alt);
-}
-
-th {
-  padding:
-    13px 16px;
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-  font-weight:
-    500;
-
-  letter-spacing:
-    .05em;
-
-  text-align:
-    left;
-}
-
-td {
-  padding:
-    16px;
-
-  border-top:
-    1px solid var(--border);
-
-  vertical-align:
-    middle;
-}
-
-tbody tr:hover {
-  background:
-    #13181e;
-}
-
-.deployment-name {
-  margin-bottom:
-    5px;
-
-  color:
-    #f0f2f4;
-
-  font-weight:
-    650;
-}
-
-.deployment-path {
-  color:
-    var(--muted);
-
-  font-size:
-    11px;
-}
-
-.status {
-  display:
-    inline-flex;
-
-  align-items:
-    center;
-
-  gap:
-    7px;
-
-  font-size:
-    10px;
-}
-
-.status span {
-  width:
-    6px;
-  height:
-    6px;
-
-  display:
-    inline-block;
-
-  border-radius:
-    50%;
-}
-
-.status.running {
-  color:
-    var(--green);
-}
-
-.status.running span {
-  background:
-    var(--green);
-}
-
-.status.stopped {
-  color:
-    var(--muted);
-}
-
-.status.stopped span {
-  background:
-    #6e7680;
-}
-
-.image-name {
-  max-width:
-    320px;
-
-  overflow:
-    hidden;
-
-  color:
-    #aab1b9;
-
-  font-size:
-    11px;
-
-  text-overflow:
-    ellipsis;
-
-  white-space:
-    nowrap;
-}
-
-.created {
-  color:
-    #aab1b9;
-
-  font-size:
-    11px;
-}
-
-.actions {
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  gap:
-    7px;
-
-  white-space:
-    nowrap;
-}
-
-.actions form {
-  margin:
-    0;
-}
-
-.action {
-  min-height:
-    32px;
-
-  padding:
-    0 10px;
-
-  display:
-    inline-flex;
-
-  align-items:
-    center;
-  justify-content:
-    center;
-
-  border:
-    1px solid var(--border);
-
-  border-radius:
-    4px;
-
-  background:
-    #11161b;
-
-  color:
-    #c2c8cf;
-
-  font-size:
-    10px;
-
-  cursor:
-    pointer;
-}
-
-.action:hover {
-  border-color:
-    #414a55;
-
-  color:
-    white;
-}
-
-.action.success {
-  border-color:
-    rgba(
-      53,
-      200,
-      120,
-      .45
-    );
-
-  color:
-    var(--green);
-}
-
-.action.danger {
-  border-color:
-    rgba(
-      239,
-      94,
-      103,
-      .45
-    );
-
-  color:
-    var(--red);
-}
-
-.action.disabled {
-  opacity:
-    .35;
-
-  cursor:
-    not-allowed;
-}
-
-.table-footer {
-  padding:
-    17px 2px;
-
-  display:
-    flex;
-
-  justify-content:
-    space-between;
-
-  color:
-    var(--muted);
-
-  font-size:
-    10px;
-}
-
-.hidden-row {
-  display:
-    none;
-}
-
-@media (
-  max-width:
-  900px
-) {
-
-  .layout {
-    grid-template-columns:
-      1fr;
-  }
-
-  .sidebar {
-    display:
-      none;
-  }
-
-  .content {
-    padding:
-      24px;
-  }
-
-  .stats {
-    grid-template-columns:
-      1fr;
-  }
-
-  .page-head {
-    align-items:
-      flex-start;
-
-    flex-direction:
-      column;
-  }
-
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-<header class="header">
-
-  <div class="header-inner">
-
-    <div class="brand">
-      <strong>STAARK</strong>
-      <span>DEMO CONSOLE</span>
-    </div>
-
-    <div class="header-meta">
-
-      <div class="connection">
-        <span
-          class="connection-dot"
-        ></span>
-
-        Manager Connected
-      </div>
-
-      <div>
-        ${escapeHtml(now)}
-      </div>
-
-    </div>
-
+app.get("/manage", async (req, res) => {
+  try {
+    const data = await manager("/console");
+    const demos = data.demos || [];
+    const running = demos.filter(isRunning).length;
+    const stopped = demos.length - running;
+    const attention = demos.filter(isAttention).length;
+    const now = new Date().toLocaleString("sv-SE", { hour12: false });
+
+    const rows = demos
+      .map((demo) => {
+        const slug = demo.slug || String(demo.container || "").replace(/^staark-demo-/, "");
+        const online = isRunning(demo);
+        const attentionState = isAttention(demo);
+        const image = demo.image || "—";
+        const url = demo.url || `https://${DEMO_HOST}/${slug}`;
+        const filterState = attentionState ? "attention" : online ? "running" : "stopped";
+
+        return `<article class="deployment-row" data-row data-search="${escapeHtml(`${slug} ${image}`.toLowerCase())}" data-status="${filterState}">
+  <div class="deployment-main">
+    <div class="deployment-name">${escapeHtml(slug)}</div>
+    <div class="deployment-path">/${escapeHtml(slug)}</div>
   </div>
+  <div><span class="status ${stateClass(demo)}">${escapeHtml(stateLabel(demo))}</span></div>
+  <div class="deployment-image"><div class="image-name" title="${escapeHtml(image)}">${escapeHtml(image)}</div></div>
+  <div class="created">${escapeHtml(formatCreated(demo.created))}</div>
+  <div class="actions">
+    ${online ? `<a class="button" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">↗ Open</a>` : `<span class="button disabled">↗ Open</span>`}
+    <a class="button" href="/manage/${encodeURIComponent(slug)}/logs">▤ Logs</a>
+    ${online
+      ? `<form method="POST" action="/manage/${encodeURIComponent(slug)}/stop"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button danger" type="submit">■ Stop</button></form>`
+      : `<form method="POST" action="/manage/${encodeURIComponent(slug)}/start"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button success" type="submit">▶ Start</button></form>`}
+    <form method="POST" action="/manage/${encodeURIComponent(slug)}/remove" onsubmit="return confirm('Remove this demo environment?')"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button danger" type="submit">× Remove</button></form>
+  </div>
+</article>`;
+      })
+      .join("");
 
-</header>
+    const errorNotice = req.query.error
+      ? `<div class="notice error">${escapeHtml(req.query.error)}</div>`
+      : "";
 
-
-<div class="layout">
-
-  <aside class="sidebar">
-
-    <nav class="nav">
-
-      <a
-        class="nav-item active"
-        href="/manage"
-      >
-        <span class="nav-icon">
-          ▤
-        </span>
-
-        Environments
-      </a>
-
-      <a
-        class="nav-item"
-        href="/manage"
-      >
-        <span class="nav-icon">
-          ≡
-        </span>
-
-        Logs
-      </a>
-
-      <span
-        class="nav-item"
-      >
-        <span class="nav-icon">
-          ⚙
-        </span>
-
-        Settings
-      </span>
-
-    </nav>
-
-
-    <div class="sidebar-bottom">
-
-      demo.staark-app.cloud
-      <br>
-
-      console v1.0.0
-
-    </div>
-
-  </aside>
-
-
-  <main class="content">
-
-    <section class="page-head">
-
-      <div>
-
-        <div class="page-label">
-          INFRASTRUCTURE
-        </div>
-
-        <h1>
-          Demo environments
-        </h1>
-
-        <div class="subtitle">
-          Manage and monitor
-          your demo deployments.
-        </div>
-
-      </div>
-
-
+    res.send(`${shellStart({
+      title: "Demo environments",
+      subtitle: "Monitor deployments, open previews, inspect logs and control container lifecycle.",
+      now,
+    })}
       <div class="head-actions">
-
-        <a
-          class="refresh"
-          href="/manage"
-        >
-          ↻ Refresh
-        </a>
-
-        <div class="last-updated">
-
-          Last updated
-          <br>
-
-          ${escapeHtml(now)}
-
-        </div>
-
+        <a class="button" href="/manage">↻ Refresh</a>
       </div>
-
     </section>
-
-
+    ${errorNotice}
     <section class="stats">
-
-      <div class="stat">
-
-        <span class="stat-label">
-          Total
-        </span>
-
-        <span class="stat-value">
-          ${demos.length}
-        </span>
-
-      </div>
-
-
-      <div class="stat">
-
-        <span class="stat-label">
-          Running
-        </span>
-
-        <span
-          class="stat-value green"
-        >
-          ${running}
-        </span>
-
-      </div>
-
-
-      <div class="stat">
-
-        <span class="stat-label">
-          Stopped
-        </span>
-
-        <span class="stat-value">
-          ${stopped}
-        </span>
-
-      </div>
-
+      <div class="stat"><div class="stat-top"><span class="stat-label">Total</span><span class="stat-icon">▤</span></div><strong class="stat-value">${demos.length}</strong><span class="stat-meta">Demo environments</span></div>
+      <div class="stat"><div class="stat-top"><span class="stat-label">Running</span><span class="stat-icon">●</span></div><strong class="stat-value green">${running}</strong><span class="stat-meta">Serving previews</span></div>
+      <div class="stat"><div class="stat-top"><span class="stat-label">Stopped</span><span class="stat-icon">■</span></div><strong class="stat-value">${stopped}</strong><span class="stat-meta">Currently offline</span></div>
+      <div class="stat"><div class="stat-top"><span class="stat-label">Attention</span><span class="stat-icon">!</span></div><strong class="stat-value ${attention ? "amber" : ""}">${attention}</strong><span class="stat-meta">Unhealthy or unstable</span></div>
     </section>
-
-
     <section class="toolbar">
+      <div class="search-wrap"><span class="search-icon">⌕</span><input id="search" class="search" type="search" placeholder="Search name or image…" autocomplete="off"></div>
+      <select id="filter"><option value="all">All status</option><option value="running">Running</option><option value="stopped">Stopped</option><option value="attention">Attention</option></select>
+    </section>
+    <section class="deployments">
+      <div class="deployments-head"><span>Environment</span><span>Status</span><span>Image</span><span>Created</span><span>Actions</span></div>
+      ${rows || `<div class="empty"><strong>No demo environments</strong>Deploy a project from Staark Hub and it will appear here.</div>`}
+    </section>
+    <div class="table-footer"><span id="counter">Showing ${demos.length} of ${demos.length} environments</span><span>${escapeHtml(data.host || DEMO_HOST)}</span></div>
+    <script>
+      const search = document.getElementById('search');
+      const filter = document.getElementById('filter');
+      const counter = document.getElementById('counter');
+      const rows = Array.from(document.querySelectorAll('[data-row]'));
+      function applyFilters() {
+        const query = search.value.trim().toLowerCase();
+        const status = filter.value;
+        let visible = 0;
+        for (const row of rows) {
+          const matchesSearch = !query || (row.dataset.search || '').includes(query);
+          const matchesStatus = status === 'all' || row.dataset.status === status;
+          const show = matchesSearch && matchesStatus;
+          row.classList.toggle('hidden-row', !show);
+          if (show) visible++;
+        }
+        counter.textContent = 'Showing ' + visible + ' of ' + rows.length + ' environments';
+      }
+      search.addEventListener('input', applyFilters);
+      filter.addEventListener('change', applyFilters);
+    </script>
+  ${shellEnd()}`);
+  } catch (error) {
+    console.error(error);
+    res.status(502).send(`<!doctype html><html><body style="background:#090b0e;color:#edf1f4;font-family:system-ui;padding:30px"><h1>Demo manager unavailable</h1><pre>${escapeHtml(error.message)}</pre></body></html>`);
+  }
+});
 
-      <div class="search-wrap">
+app.post("/manage/:slug/stop", verifyCsrf, async (req, res) => {
+  try {
+    await manager(`/stop/${encodeURIComponent(req.params.slug)}`, { method: "POST" });
+    res.redirect("/manage");
+  } catch (error) {
+    res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
+  }
+});
 
-        <span class="search-icon">
-          ⌕
-        </span>
+app.post("/manage/:slug/start", verifyCsrf, async (req, res) => {
+  try {
+    await manager(`/start/${encodeURIComponent(req.params.slug)}`, { method: "POST" });
+    res.redirect("/manage");
+  } catch (error) {
+    res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
+  }
+});
 
-        <input
-          id="search"
-          class="search"
-          type="search"
-          placeholder="Search environments..."
-          autocomplete="off"
-        >
+app.post("/manage/:slug/remove", verifyCsrf, async (req, res) => {
+  try {
+    await manager(`/demo/${encodeURIComponent(req.params.slug)}`, { method: "DELETE" });
+    res.redirect("/manage");
+  } catch (error) {
+    res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
+  }
+});
 
+app.get("/manage/:slug/logs", async (req, res) => {
+  try {
+    const data = await manager(`/logs/${encodeURIComponent(req.params.slug)}?tail=300`);
+    const now = new Date().toLocaleString("sv-SE", { hour12: false });
+
+    res.send(`${shellStart({
+      title: `${req.params.slug} logs`,
+      subtitle: `Latest ${data.tail || 300} lines from the demo container.`,
+      eyebrow: "Environment / Logs",
+      now,
+    })}
+      <div class="head-actions">
+        <a class="button" href="/manage/${encodeURIComponent(req.params.slug)}/logs">↻ Reload</a>
+        <a class="button primary" href="/manage">← Environments</a>
       </div>
-
-
-      <select id="filter">
-
-        <option value="all">
-          All status
-        </option>
-
-        <option value="running">
-          Running
-        </option>
-
-        <option value="stopped">
-          Stopped
-        </option>
-
-      </select>
-
     </section>
-
-
-    <section class="table-wrap">
-
-      <table>
-
-        <thead>
-
-          <tr>
-            <th>NAME</th>
-            <th>STATUS</th>
-            <th>IMAGE</th>
-            <th>CREATED</th>
-            <th>ACTIONS</th>
-          </tr>
-
-        </thead>
-
-        <tbody id="rows">
-
-          ${
-            rows ||
-            `
-            <tr>
-              <td
-                colspan="5"
-                style="
-                  color:#858d98;
-                  text-align:center;
-                  padding:40px
-                "
-              >
-                No demo environments found.
-              </td>
-            </tr>
-            `
-          }
-
-        </tbody>
-
-      </table>
-
-    </section>
-
-
-    <div class="table-footer">
-
-      <span id="counter">
-        Showing ${demos.length}
-        of ${demos.length}
-        environments
-      </span>
-
-      <span>
-        Staark Demo Infrastructure
-      </span>
-
-    </div>
-
-  </main>
-
-</div>
-
-
-<script>
-
-const search =
-  document.getElementById(
-    "search"
-  );
-
-const filter =
-  document.getElementById(
-    "filter"
-  );
-
-const counter =
-  document.getElementById(
-    "counter"
-  );
-
-const rows =
-  Array.from(
-    document.querySelectorAll(
-      "[data-row]"
-    )
-  );
-
-function applyFilters() {
-
-  const query =
-    search.value
-      .trim()
-      .toLowerCase();
-
-  const status =
-    filter.value;
-
-  let visible = 0;
-
-  for (
-    const row
-    of rows
-  ) {
-
-    const name =
-      row.dataset.name || "";
-
-    const rowStatus =
-      row.dataset.status || "";
-
-    const matchSearch =
-      !query ||
-      name.includes(
-        query
-      );
-
-    const matchStatus =
-      status === "all" ||
-      status === rowStatus;
-
-    const show =
-      matchSearch &&
-      matchStatus;
-
-    row.classList.toggle(
-      "hidden-row",
-      !show
-    );
-
-    if (show) {
-      visible++;
-    }
-
+    <div class="log-head"><div class="log-meta">Container: staark-demo-${escapeHtml(req.params.slug)}</div><div class="log-meta">Updated ${escapeHtml(now)}</div></div>
+    <pre class="log-box">${escapeHtml(data.logs || "No logs available.")}</pre>
+  ${shellEnd()}`);
+  } catch (error) {
+    res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
   }
-
-  counter.textContent =
-    "Showing " +
-    visible +
-    " of " +
-    rows.length +
-    " environments";
-
-}
-
-search.addEventListener(
-  "input",
-  applyFilters
-);
-
-filter.addEventListener(
-  "change",
-  applyFilters
-);
-
-</script>
-
-</body>
-
-</html>
-      `);
-
-    } catch (error) {
-
-      console.error(
-        error
-      );
-
-      res
-        .status(500)
-        .send(
-          `<pre>${escapeHtml(
-            error.message
-          )}</pre>`
-        );
-    }
-  }
-);
-
-
-app.post(
-  "/manage/:slug/stop",
-  async (req, res) => {
-
-    try {
-
-      await manager(
-        `/stop/${req.params.slug}`,
-        {
-          method: "POST",
-        }
-      );
-
-      res.redirect(
-        "/manage"
-      );
-
-    } catch (error) {
-
-      res
-        .status(500)
-        .send(
-          escapeHtml(
-            error.message
-          )
-        );
-    }
-  }
-);
-
-
-app.post(
-  "/manage/:slug/start",
-  async (req, res) => {
-
-    try {
-
-      await manager(
-        `/start/${req.params.slug}`,
-        {
-          method: "POST",
-        }
-      );
-
-      res.redirect(
-        "/manage"
-      );
-
-    } catch (error) {
-
-      res
-        .status(500)
-        .send(
-          escapeHtml(
-            error.message
-          )
-        );
-    }
-  }
-);
-
-
-app.get(
-  "/manage/:slug/logs",
-  async (req, res) => {
-
-    try {
-
-      const data =
-        await manager(
-          `/logs/${req.params.slug}`
-        );
-
-      res.send(`
-<!doctype html>
-
-<html>
-
-<head>
-
-<meta charset="utf-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1"
->
-
-<title>
-${escapeHtml(
-  req.params.slug
-)} / Logs
-</title>
-
-<style>
-
-body {
-  margin: 0;
-
-  background: #0b0e12;
-
-  color: #d8dce1;
-
-  font-family:
-    ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    Monaco,
-    Consolas,
-    monospace;
-}
-
-main {
-  width:
-    min(
-      1200px,
-      calc(
-        100% - 40px
-      )
-    );
-
-  margin:
-    0 auto;
-
-  padding:
-    35px 0 60px;
-}
-
-a {
-  color:
-    #8aa2c8;
-
-  text-decoration:
-    none;
-}
-
-h1 {
-  margin:
-    30px 0 18px;
-
-  font-family:
-    system-ui,
-    sans-serif;
-
-  font-size:
-    24px;
-
-  font-weight:
-    600;
-}
-
-pre {
-  margin:
-    0;
-
-  padding:
-    20px;
-
-  overflow:
-    auto;
-
-  border:
-    1px solid #252b33;
-
-  border-radius:
-    4px;
-
-  background:
-    #101419;
-
-  color:
-    #bcc2ca;
-
-  font-size:
-    11px;
-
-  line-height:
-    1.65;
-
-  white-space:
-    pre-wrap;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<main>
-
-  <a href="/manage">
-    ← Back to environments
-  </a>
-
-  <h1>
-    ${escapeHtml(
-      req.params.slug
-    )}
-    / logs
-  </h1>
-
-  <pre>${escapeHtml(
-    data.logs ||
-    "No logs available."
-  )}</pre>
-
-</main>
-
-</body>
-
-</html>
-      `);
-
-    } catch (error) {
-
-      res
-        .status(500)
-        .send(
-          escapeHtml(
-            error.message
-          )
-        );
-    }
-  }
-);
-
-
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `Staark Demo Console listening on :${PORT}`
-    );
-
-  }
-);
+});
+
+app.use((req, res) => {
+  res.status(404).send("Not found");
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Staark Demo Console listening on :${PORT}`);
+});

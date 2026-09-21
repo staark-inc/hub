@@ -3,20 +3,40 @@ services:
     build: ./manager
     container_name: staark-demo-manager
     restart: unless-stopped
+    init: true
 
     environment:
       GHCR_USERNAME: ${GHCR_USERNAME}
       GHCR_TOKEN: ${GHCR_TOKEN}
       HUB_SECRET: ${HUB_SECRET}
-
-      DEMO_HOST: demo.staark-app.cloud
-      TRAEFIK_NETWORK: staark-network
+      DEMO_HOST: ${DEMO_HOST:-demo.staark-app.cloud}
+      TRAEFIK_NETWORK: ${TRAEFIK_NETWORK:-staark-network}
+      ALLOWED_IMAGE_PREFIX: ${ALLOWED_IMAGE_PREFIX:-ghcr.io/staark-inc/}
+      DOCKER_CONFIG: /tmp/.docker
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
     ports:
       - "127.0.0.1:8181:8080"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
     networks:
       - staark-network
@@ -25,26 +45,43 @@ services:
     build: ./console
     container_name: staark-demo-console
     restart: unless-stopped
+    init: true
+
+    depends_on:
+      demo-manager:
+        condition: service_healthy
 
     environment:
       MANAGER_URL: http://staark-demo-manager:8080
       HUB_SECRET: ${HUB_SECRET}
-
       CONSOLE_USER: ${CONSOLE_USER}
       CONSOLE_PASSWORD: ${CONSOLE_PASSWORD}
+      DEMO_HOST: ${DEMO_HOST:-demo.staark-app.cloud}
+
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
     networks:
       - staark-network
 
     labels:
       - "traefik.enable=true"
-
-      - "traefik.http.routers.demo-console.rule=Host(`demo.staark-app.cloud`) && PathPrefix(`/manage`)"
+      - "traefik.http.routers.demo-console.rule=Host(`${DEMO_HOST:-demo.staark-app.cloud}`) && PathPrefix(`/manage`)"
       - "traefik.http.routers.demo-console.entrypoints=web"
       - "traefik.http.routers.demo-console.priority=1000"
-
       - "traefik.http.services.demo-console.loadbalancer.server.port=8080"
-
       - "traefik.http.routers.demo-console.middlewares=demo-console-https"
       - "traefik.http.middlewares.demo-console-https.headers.customrequestheaders.X-Forwarded-Proto=https"
       - "traefik.http.middlewares.demo-console-https.headers.customrequestheaders.X-Forwarded-Port=443"
@@ -52,3 +89,4 @@ services:
 networks:
   staark-network:
     external: true
+    name: ${TRAEFIK_NETWORK:-staark-network}

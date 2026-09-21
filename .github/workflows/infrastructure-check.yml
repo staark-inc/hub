@@ -1,0 +1,45 @@
+name: Infrastructure Check
+
+on:
+  pull_request:
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/infrastructure-check.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/infrastructure-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Node syntax
+        run: |
+          node --check infrastructure/manager/src/index.js
+          node --check infrastructure/console/index.js
+
+      - name: Validate Compose
+        env:
+          GHCR_USERNAME: ci
+          GHCR_TOKEN: ci
+          HUB_SECRET: ci-secret
+          CONSOLE_USER: ci
+          CONSOLE_PASSWORD: ci-password
+        run: docker compose -f infrastructure/compose.yml config >/dev/null
+
+      - name: Build manager image
+        run: docker build -t staark-demo-manager:ci infrastructure/manager
+
+      - name: Build console image
+        run: docker build -t staark-demo-console:ci infrastructure/console
