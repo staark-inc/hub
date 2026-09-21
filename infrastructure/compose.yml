@@ -1,0 +1,54 @@
+services:
+  demo-manager:
+    build: ./manager
+    container_name: staark-demo-manager
+    restart: unless-stopped
+
+    environment:
+      GHCR_USERNAME: ${GHCR_USERNAME}
+      GHCR_TOKEN: ${GHCR_TOKEN}
+      HUB_SECRET: ${HUB_SECRET}
+
+      DEMO_HOST: demo.staark-app.cloud
+      TRAEFIK_NETWORK: staark-network
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    ports:
+      - "127.0.0.1:8181:8080"
+
+    networks:
+      - staark-network
+
+  demo-console:
+    build: ./console
+    container_name: staark-demo-console
+    restart: unless-stopped
+
+    environment:
+      MANAGER_URL: http://staark-demo-manager:8080
+      HUB_SECRET: ${HUB_SECRET}
+
+      CONSOLE_USER: ${CONSOLE_USER}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD}
+
+    networks:
+      - staark-network
+
+    labels:
+      - "traefik.enable=true"
+
+      - "traefik.http.routers.demo-console.rule=Host(`demo.staark-app.cloud`) && PathPrefix(`/manage`)"
+      - "traefik.http.routers.demo-console.entrypoints=web"
+      - "traefik.http.routers.demo-console.priority=1000"
+
+      - "traefik.http.services.demo-console.loadbalancer.server.port=8080"
+
+      - "traefik.http.routers.demo-console.middlewares=demo-console-https"
+      - "traefik.http.middlewares.demo-console-https.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.demo-console-https.headers.customrequestheaders.X-Forwarded-Port=443"
+
+networks:
+  staark-network:
+    external: true
