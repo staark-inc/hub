@@ -1,0 +1,5 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { ArrowUpRight } from "lucide-react";
+export const metadata: Metadata = { title: "Om oss" };
+export default function Page(){return <><div className="subhero"><div className="container"><p className="kicker">OM ALEX DÄCKSERVICE</p><h1>LOKALT FOKUS.<br /><em>HJÄLP PÅ PLATS.</em></h1><p>En mobil däckservice baserad i Vaggeryd med målet att göra däckservicen enklare för dig.</p></div></div><section className="section light-section"><div className="container story-grid"><span>DET PRAKTISKA GÖR SKILLNAD</span><div><h2>Service som kommer till dig.</h2><p>Alex Däckservice beskriver sig som en däckservice i Vaggeryd som kan komma till kunden med servicebil. I detta koncept gör vi den fördelen tydlig från första stund.</p><p>Företagets egen berättelse, bilder och exakta serviceområde bör läggas till tillsammans med Alex före publicering.</p><Link href="/kontakt" className="text-link">Kontakta verksamheten <ArrowUpRight size={19}/></Link></div></div></section></>}

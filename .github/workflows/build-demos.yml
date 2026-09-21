@@ -1,0 +1,61 @@
+name: Build Demo Images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "projects/**"
+      - ".github/workflows/build-demos.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - name: Alex Dack
+            context: ./projects/alexdack-web
+            image: demo-alexdack
+            base_path: /alexdack
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+
+          build-args: |
+            DEMO_BASE_PATH=${{ matrix.base_path }}
+
+          tags: |
+            ghcr.io/staark-inc/${{ matrix.image }}:latest
+            ghcr.io/staark-inc/${{ matrix.image }}:sha-${{ github.sha }}
+
+          labels: |
+            org.opencontainers.image.source=https://github.com/staark-inc/hub
