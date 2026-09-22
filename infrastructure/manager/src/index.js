@@ -22,6 +22,9 @@ app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
   next();
 });
 
@@ -121,6 +124,37 @@ async function ghcrLogin() {
   );
 }
 
+async function getContainerStats() {
+  const { stdout } = await docker([
+    "stats",
+    "--no-stream",
+    "--format",
+    "{{json .}}",
+  ]);
+
+  const result = new Map();
+
+  for (const line of stdout.trim().split("\n").filter(Boolean)) {
+    try {
+      const item = JSON.parse(line);
+      const name = item.Name || "";
+
+      if (!name.startsWith("staark-demo-")) continue;
+
+      result.set(name, {
+        cpu: item.CPUPerc || "—",
+        memory: item.MemUsage || "—",
+        memoryPercent: item.MemPerc || "—",
+        pids: item.PIDs || "—",
+      });
+    } catch {
+      // Ignore one malformed Docker stats row rather than failing the console.
+    }
+  }
+
+  return result;
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -149,6 +183,14 @@ app.get("/console", async (req, res) => {
       .filter(Boolean)
       .map((line) => JSON.parse(line));
 
+    let statsByContainer = new Map();
+
+    try {
+      statsByContainer = await getContainerStats();
+    } catch (error) {
+      console.warn("[STATS] Could not read container stats:", error.message);
+    }
+
     const demos = rows.map((item) => {
       const container = item.Names || "";
       const slug = container.replace(/^staark-demo-/, "");
@@ -160,10 +202,12 @@ app.get("/console", async (req, res) => {
         container,
         image: item.Image || "",
         status: item.Status || "",
+        uptime: item.Status || "",
         state,
         health,
         running: state === "running",
         created: item.CreatedAt || null,
+        resources: statsByContainer.get(container) || null,
         url: `https://${DEMO_HOST}/${slug}`,
       };
     });
@@ -295,6 +339,23 @@ app.post("/start/:slug", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: "Start failed",
+      details: error.stderr || error.message,
+    });
+  }
+});
+
+app.post("/restart/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    if (!validSlug(slug)) {
+      return res.status(400).json({ error: "Invalid slug" });
+    }
+
+    await docker(["restart", `staark-demo-${slug}`]);
+    res.json({ ok: true, slug, status: "running" });
+  } catch (error) {
+    res.status(500).json({
+      error: "Restart failed",
       details: error.stderr || error.message,
     });
   }
