@@ -53,3 +53,16 @@ The manager has access to `/var/run/docker.sock`, which effectively grants host-
 ## CI
 
 `.github/workflows/infrastructure-check.yml` validates JavaScript syntax, Docker Compose configuration, and builds both infrastructure images for changes touching this directory.
+
+## Console operations
+
+The infrastructure console exposes Start, Stop, Restart, Logs and Remove actions for demo containers. Running environments also report Docker CPU and memory usage and refresh automatically every 30 seconds by default.
+
+The console keeps search/filter state across automatic refreshes. Auto-refresh can be disabled from the dashboard.
+
+## Additional security hardening
+
+The console applies restrictive browser security headers, CSRF tokens for state-changing forms, constant-time credential comparisons, and an in-memory authentication failure throttle.
+
+The manager still requires Docker control privileges to create, remove, start and stop demo containers. Treat access to the manager as privileged. It remains bound to loopback on the host and is not intended to be internet-facing.
+

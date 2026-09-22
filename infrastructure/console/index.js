@@ -15,12 +15,17 @@ const CSRF_TOKEN = randomBytes(32).toString("hex");
 const PUBLIC_DIR = fileURLToPath(new URL("./public", import.meta.url));
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 app.use(express.urlencoded({ extended: false, limit: "16kb" }));
 app.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; style-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -43,9 +48,37 @@ function safeEqual(left, right) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+const AUTH_LIMIT = 8;
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_BLOCK_MS = 15 * 60 * 1000;
+const authAttempts = new Map();
+
+function authEntry(req) {
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  let entry = authAttempts.get(key);
+
+  if (!entry || now - entry.windowStarted > AUTH_WINDOW_MS) {
+    entry = { failures: 0, windowStarted: now, blockedUntil: 0 };
+    authAttempts.set(key, entry);
+  }
+
+  return { key, entry, now };
+}
+
 function auth(req, res, next) {
   if (!CONSOLE_USER || !CONSOLE_PASSWORD) {
     return res.status(503).send("Console credentials are not configured");
+  }
+
+  const { key, entry, now } = authEntry(req);
+
+  if (entry.blockedUntil > now) {
+    res.setHeader(
+      "Retry-After",
+      String(Math.ceil((entry.blockedUntil - now) / 1000))
+    );
+    return res.status(429).send("Too many authentication failures");
   }
 
   const header = req.headers.authorization || "";
@@ -66,10 +99,18 @@ function auth(req, res, next) {
   const password = separator >= 0 ? decoded.slice(separator + 1) : "";
 
   if (!safeEqual(username, CONSOLE_USER) || !safeEqual(password, CONSOLE_PASSWORD)) {
+    entry.failures += 1;
+
+    if (entry.failures >= AUTH_LIMIT) {
+      entry.blockedUntil = now + AUTH_BLOCK_MS;
+    }
+
+    authAttempts.set(key, entry);
     res.setHeader("WWW-Authenticate", 'Basic realm="Staark Demo Console"');
     return res.status(401).send("Unauthorized");
   }
 
+  authAttempts.delete(key);
   next();
 }
 
@@ -132,6 +173,16 @@ function stateClass(demo) {
 function formatCreated(value) {
   if (!value) return "—";
   return String(value).replace(/\s+[+-]\d{4}.*$/, "").slice(0, 19);
+}
+
+function resourceText(demo) {
+  if (!demo.resources) return "No live metrics";
+  return `${demo.resources.cpu || "—"} CPU · ${demo.resources.memory || "—"} RAM`;
+}
+
+function uptimeText(demo) {
+  const value = String(demo.uptime || "").trim();
+  return value || "—";
 }
 
 function shellStart({ title, subtitle, eyebrow = "Infrastructure", now }) {
@@ -220,12 +271,19 @@ app.get("/manage", async (req, res) => {
     <div class="deployment-name">${escapeHtml(slug)}</div>
     <div class="deployment-path">/${escapeHtml(slug)}</div>
   </div>
-  <div><span class="status ${stateClass(demo)}">${escapeHtml(stateLabel(demo))}</span></div>
-  <div class="deployment-image"><div class="image-name" title="${escapeHtml(image)}">${escapeHtml(image)}</div></div>
-  <div class="created">${escapeHtml(formatCreated(demo.created))}</div>
+  <div class="status-stack">
+    <span class="status ${stateClass(demo)}">${escapeHtml(stateLabel(demo))}</span>
+    <span class="runtime-meta">${escapeHtml(uptimeText(demo))}</span>
+  </div>
+  <div class="deployment-image">
+    <div class="image-name" title="${escapeHtml(image)}">${escapeHtml(image)}</div>
+    <div class="runtime-meta">${escapeHtml(resourceText(demo))}</div>
+  </div>
+  <div class="created"><strong>${escapeHtml(formatCreated(demo.created))}</strong><span>Created</span></div>
   <div class="actions">
     ${online ? `<a class="button" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">↗ Open</a>` : `<span class="button disabled">↗ Open</span>`}
     <a class="button" href="/manage/${encodeURIComponent(slug)}/logs">▤ Logs</a>
+    ${online ? `<form method="POST" action="/manage/${encodeURIComponent(slug)}/restart"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button warning" type="submit">↻ Restart</button></form>` : ""}
     ${online
       ? `<form method="POST" action="/manage/${encodeURIComponent(slug)}/stop"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button danger" type="submit">■ Stop</button></form>`
       : `<form method="POST" action="/manage/${encodeURIComponent(slug)}/start"><input type="hidden" name="csrf" value="${CSRF_TOKEN}"><button class="button success" type="submit">▶ Start</button></form>`}
@@ -245,6 +303,8 @@ app.get("/manage", async (req, res) => {
       now,
     })}
       <div class="head-actions">
+        <span class="updated-at">Updated ${escapeHtml(now)}</span>
+        <button class="button" id="auto-refresh" type="button">Auto 30s</button>
         <a class="button" href="/manage">↻ Refresh</a>
       </div>
     </section>
@@ -260,7 +320,7 @@ app.get("/manage", async (req, res) => {
       <select id="filter"><option value="all">All status</option><option value="running">Running</option><option value="stopped">Stopped</option><option value="attention">Attention</option></select>
     </section>
     <section class="deployments">
-      <div class="deployments-head"><span>Environment</span><span>Status</span><span>Image</span><span>Created</span><span>Actions</span></div>
+      <div class="deployments-head"><span>Environment</span><span>Status / uptime</span><span>Image / resources</span><span>Created</span><span>Actions</span></div>
       ${rows || `<div class="empty"><strong>No demo environments</strong>Deploy a project from Staark Hub and it will appear here.</div>`}
     </section>
     <div class="table-footer"><span id="counter">Showing ${demos.length} of ${demos.length} environments</span><span>${escapeHtml(data.host || DEMO_HOST)}</span></div>
@@ -269,6 +329,17 @@ app.get("/manage", async (req, res) => {
       const filter = document.getElementById('filter');
       const counter = document.getElementById('counter');
       const rows = Array.from(document.querySelectorAll('[data-row]'));
+      const autoRefresh = document.getElementById('auto-refresh');
+      const SEARCH_KEY = 'staark-demo-console-search';
+      const FILTER_KEY = 'staark-demo-console-filter';
+      const AUTO_KEY = 'staark-demo-console-auto';
+      let refreshTimer = null;
+
+      function persistView() {
+        sessionStorage.setItem(SEARCH_KEY, search.value);
+        sessionStorage.setItem(FILTER_KEY, filter.value);
+      }
+
       function applyFilters() {
         const query = search.value.trim().toLowerCase();
         const status = filter.value;
@@ -282,8 +353,45 @@ app.get("/manage", async (req, res) => {
         }
         counter.textContent = 'Showing ' + visible + ' of ' + rows.length + ' environments';
       }
-      search.addEventListener('input', applyFilters);
-      filter.addEventListener('change', applyFilters);
+
+      function autoEnabled() {
+        return localStorage.getItem(AUTO_KEY) !== 'off';
+      }
+
+      function scheduleRefresh() {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        autoRefresh.classList.toggle('active', autoEnabled());
+        autoRefresh.textContent = autoEnabled() ? 'Auto 30s · On' : 'Auto 30s · Off';
+
+        if (autoEnabled()) {
+          refreshTimer = setTimeout(() => {
+            persistView();
+            location.reload();
+          }, 30000);
+        }
+      }
+
+      search.value = sessionStorage.getItem(SEARCH_KEY) || '';
+      const savedFilter = sessionStorage.getItem(FILTER_KEY) || 'all';
+      if (Array.from(filter.options).some(option => option.value === savedFilter)) {
+        filter.value = savedFilter;
+      }
+
+      search.addEventListener('input', () => {
+        persistView();
+        applyFilters();
+      });
+      filter.addEventListener('change', () => {
+        persistView();
+        applyFilters();
+      });
+      autoRefresh.addEventListener('click', () => {
+        localStorage.setItem(AUTO_KEY, autoEnabled() ? 'off' : 'on');
+        scheduleRefresh();
+      });
+
+      applyFilters();
+      scheduleRefresh();
     </script>
   ${shellEnd()}`);
   } catch (error) {
@@ -304,6 +412,15 @@ app.post("/manage/:slug/stop", verifyCsrf, async (req, res) => {
 app.post("/manage/:slug/start", verifyCsrf, async (req, res) => {
   try {
     await manager(`/start/${encodeURIComponent(req.params.slug)}`, { method: "POST" });
+    res.redirect("/manage");
+  } catch (error) {
+    res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
+  }
+});
+
+app.post("/manage/:slug/restart", verifyCsrf, async (req, res) => {
+  try {
+    await manager(`/restart/${encodeURIComponent(req.params.slug)}`, { method: "POST" });
     res.redirect("/manage");
   } catch (error) {
     res.redirect(`/manage?error=${encodeURIComponent(error.message)}`);
